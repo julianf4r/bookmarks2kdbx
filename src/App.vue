@@ -1,243 +1,156 @@
 <script setup>
-import { ref } from 'vue'
-import * as kdbxweb from 'kdbxweb'
+import { computed, ref } from 'vue'
+import { ArrowDownToLine, ArrowRight, Bookmark, CheckCircle2, CircleAlert, FileText, Folder, KeyRound, LoaderCircle, Monitor, ShieldCheck, Upload, Eye, EyeOff } from '@lucide/vue'
+import BookmarkTree from './BookmarkTree.vue'
+import { mergeTrees, parseChromeBookmarksHtml, parseChromeBookmarksJson } from './bookmarks.js'
+import { createKdbx } from './exportKdbx.js'
 
-// Reactive state
 const files = ref([])
 const tree = ref([])
 const password = ref('')
 const showPassword = ref(false)
 const status = ref('')
-
-// Utility functions
-function parseChromeBookmarksHtml(text) {
-    // Simple HTML parser for Chrome's exported bookmarks.html
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(text, 'text/html');
-    function walkDl(dl) {
-        const items = [];
-        for (const node of dl.childNodes) {
-            if (node.nodeName === 'DT') {
-                const h3 = node.querySelector('h3');
-                const a = node.querySelector('a');
-                if (h3) {
-                    const subDl = node.querySelector('dl');
-                    items.push({
-                        type: 'folder',
-                        title: h3.textContent || 'Folder',
-                        children: subDl ? walkDl(subDl) : []
-                    });
-                } else if (a) {
-                    items.push({ type: 'bookmark', title: a.textContent || a.getAttribute('href'), url: a.getAttribute('href') });
-                }
-            }
-        }
-        return items;
-    }
-    const topDl = doc.querySelector('dl');
-    if (!topDl) return [];
-    return walkDl(topDl);
-}
-
-function parseChromeBookmarksJson(text) {
-    const obj = JSON.parse(text);
-    function nodeToItems(node) {
-        const items = [];
-        if (!node) return items;
-        if (node.type === 'url') return [{ type: 'bookmark', title: node.name || node.url, url: node.url }];
-        if (node.children && Array.isArray(node.children)) {
-            for (const ch of node.children) {
-                if (ch.type === 'folder') {
-                    items.push({ type: 'folder', title: ch.name || 'Folder', children: nodeToItems({ children: ch.children }) });
-                } else if (ch.type === 'url') {
-                    items.push({ type: 'bookmark', title: ch.name || ch.url, url: ch.url });
-                }
-            }
-        }
-        return items;
-    }
-    // Chrome's bookmark JSON often has roots: bookmark_bar, other, synced
-    const roots = obj.roots || obj;
-    const res = [];
-    for (const k of Object.keys(roots)) {
-        if (roots[k] && roots[k].children) {
-            res.push({ type: 'folder', title: roots[k].name || k, children: nodeToItems(roots[k]) });
+const statusKind = ref('idle')
+const parsing = ref(false)
+const exporting = ref(false)
+const fileInput = ref(null)
+const busy = computed(() => parsing.value || exporting.value)
+const stats = computed(() => {
+    const result = { bookmarks: 0, folders: 0 }
+    function count(items) {
+        for (const item of items) {
+            if (item.type === 'folder') {
+                result.folders++
+                count(item.children)
+            } else result.bookmarks++
         }
     }
-    return res;
-}
+    count(tree.value)
+    return result
+})
 
-function mergeTrees(trees) {
-    // trees: array of item arrays. Need to merge preserving folders, and dedupe URLs (first occurrence)
-    const seen = new Set();
-    function cloneFilter(items) {
-        const out = [];
-        for (const it of items) {
-            if (it.type === 'bookmark') {
-                if (!it.url) continue;
-                if (seen.has(it.url)) continue;
-                seen.add(it.url);
-                out.push({ ...it });
-            } else if (it.type === 'folder') {
-                const children = cloneFilter(it.children || []);
-                out.push({ type: 'folder', title: it.title, children });
-            }
-        }
-        return out;
-    }
-    // Flatten by creating a top-level container with combined children
-    const combined = [];
-    for (const t of trees) {
-        for (const it of t) combined.push(it);
-    }
-    return cloneFilter(combined);
-}
-
-function escapeHtml(s) {
-    return (s || '').toString().replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] || c))
-}
-
-// Event handlers
-async function handleFiles(ev) {
-    const list = Array.from(ev.target.files || ev.files || [])
-    files.value = list
-    status.value = 'Parsing files...'
+async function handleFiles(event) {
+    const selected = Array.from(event.target.files || [])
+    if (!selected.length || busy.value) return
+    files.value = selected
+    tree.value = []
+    parsing.value = true
+    statusKind.value = 'working'
+    status.value = '正在读取并整理书签…'
     const trees = []
-    for (const f of list) {
-        const txt = await f.text()
-        // try json first
-        let parsed = []
-        try {
-            parsed = parseChromeBookmarksJson(txt)
-        } catch (e) {
+    const failed = []
+    try {
+        for (const file of selected) {
             try {
-                parsed = parseChromeBookmarksHtml(txt)
-            } catch (e2) {
-                console.warn('failed parse', e2)
+                const text = await file.text()
+                let parsed
+                try {
+                    parsed = parseChromeBookmarksJson(text)
+                } catch {
+                    parsed = parseChromeBookmarksHtml(text)
+                }
+                if (!parsed.length) failed.push(file.name)
+                else trees.push(parsed)
+            } catch {
+                failed.push(file.name)
             }
         }
-        trees.push(parsed)
-    }
-    tree.value = mergeTrees(trees)
-    status.value = '解析完成'
-}
-
-function renderTree(items) {
-    return items.map((it) => {
-        if (it.type === 'folder') {
-            return (`<div class="folder"><div><strong>${escapeHtml(it.title)}</strong></div><div class="tree">${renderTree(it.children || []).join('')}</div></div>`)
+        tree.value = mergeTrees(trees)
+        if (failed.length) {
+            statusKind.value = 'error'
+            status.value = `无法读取书签：${failed.join('、')}。请选择浏览器导出的 HTML 或书签 JSON 文件。${stats.value.bookmarks ? '其余文件已解析，可继续导出。' : ''}`
+        } else if (!stats.value.bookmarks) {
+            statusKind.value = 'error'
+            status.value = '文件中没有可导出的书签，请选择其他文件。'
+        } else {
+            statusKind.value = 'success'
+            status.value = `解析完成，已整理 ${stats.value.bookmarks} 个书签。`
         }
-        return (`<div class="entry">${escapeHtml(it.title)} — <span class="small">${escapeHtml(it.url)}</span></div>`)
-    })
+    } finally {
+        parsing.value = false
+        event.target.value = ''
+    }
 }
 
 async function generateKdbx() {
-    if (!tree.value.length) { status.value = '没有书签数据'; return }
-    status.value = '生成 KDBX 中...'
-    const cred = new kdbxweb.Credentials(kdbxweb.ProtectedValue.fromString(password.value || ''))
-    const db = kdbxweb.Kdbx.create(cred, 'Bookmarks')
-
-    // Force AES KDF and KDBX v3 to avoid Argon2 NotImplemented error
+    if (busy.value || !stats.value.bookmarks) return
+    exporting.value = true
+    statusKind.value = 'working'
+    status.value = '正在生成 KDBX 文件…'
     try {
-        db.setKdf(kdbxweb.Consts.KdfId.Aes)
-    } catch (e) {
-        // ignore if not supported
-    }
-    try {
-        db.setVersion(3)
-    } catch (e) {
-        // ignore if not supported
-    }
-
-    const defaultGroup = db.getDefaultGroup()
-
-    function addItemsToGroup(items, parentGroup) {
-        for (const it of items) {
-            if (it.type === 'folder') {
-                const g = db.createGroup(parentGroup, it.title || 'Folder')
-                addItemsToGroup(it.children || [], g)
-            } else if (it.type === 'bookmark') {
-                const e = db.createEntry(parentGroup)
-                e.fields.set('Title', it.title || '')
-                e.fields.set('URL', it.url || '')
-            }
+        const data = await createKdbx(tree.value, password.value)
+        const url = URL.createObjectURL(new Blob([data], { type: 'application/octet-stream' }))
+        const anchor = document.createElement('a')
+        const pad = (n) => String(n).padStart(2, '0')
+        const now = new Date()
+        const filename = `书签_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.kdbx`
+        anchor.href = url
+        anchor.download = filename
+        document.body.appendChild(anchor)
+        try {
+            anchor.click()
+        } finally {
+            anchor.remove()
+            setTimeout(() => URL.revokeObjectURL(url), 1000)
         }
+        statusKind.value = 'success'
+        status.value = `已生成 ${filename}，请查看浏览器下载。`
+    } catch (error) {
+        statusKind.value = 'error'
+        status.value = `生成失败：${error.message || error}`
+    } finally {
+        exporting.value = false
     }
-
-    addItemsToGroup(tree.value, defaultGroup)
-
-    let data
-    try {
-        data = await db.save()
-    } catch (e) {
-        // If Argon2 not implemented or other KDF issues, try forcing AES + v3 and save again
-        const isArgon2Error =
-            (e && e.message && /argon2/i.test(e.message)) ||
-            (e && e.code === kdbxweb.Consts.ErrorCodes.NotImplemented)
-        if (isArgon2Error) {
-            try {
-                db.setKdf(kdbxweb.Consts.KdfId.Aes)
-                db.setVersion(3)
-                data = await db.save()
-            } catch (e2) {
-                status.value = `保存失败：${e2.message || e2}`
-                throw e2
-            }
-        } else {
-            status.value = `保存失败：${e.message || e}`
-            throw e
-        }
-    }
-    const blob = new Blob([data], { type: 'application/octet-stream' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    const pad = (n) => String(n).padStart(2, '0')
-    const now = new Date()
-    const filename = `书签_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.kdbx`
-    a.download = filename
-    a.click()
-    URL.revokeObjectURL(url)
-    status.value = `生成完成，文件 ${filename} 已下载`
 }
 </script>
 
 <template>
-    <div class="container">
-        <div class="header">
-            <div>
-                <div class="title">书签转 kdbx</div>
-                <div class="notice">所有处理在本地浏览器完成，不会上传到服务器</div>
-            </div>
-        </div>
+    <main class="container">
+        <header class="header">
+            <div class="brand"><span class="brand-icon"><Bookmark aria-hidden="true" /></span><span>Bookmarks<span class="brand-divider">/</span>KDBX</span></div>
+            <span class="theme-label"><Monitor aria-hidden="true" /> 外观跟随系统</span>
+        </header>
 
-        <div class="card">
-            <div class="controls">
-                <label class="file-input btn">
-                    选择书签文件
-                    <input type="file" multiple @change="handleFiles" accept=".html,application/json,text/json" />
-                </label>
-                <button class="btn primary" @click="generateKdbx">生成并下载 .kdbx</button>
-                <div class="password">
-                    <input :type="showPassword ? 'text' : 'password'" class="input" placeholder="设置 KDBX 密码（可选）"
-                        v-model="password" />
-                    <button class="btn eye-btn" @click="showPassword = !showPassword"
-                        :title="showPassword ? '隐藏密码' : '显示密码'">
-                        {{ showPassword ? '👁️' : '👁️‍🗨️' }}
-                    </button>
+        <section class="intro" aria-labelledby="page-title">
+            <div class="eyebrow">让书签井然有序</div>
+            <h1 id="page-title">浏览器书签转 KeePass 数据库</h1>
+            <!-- <p>导入浏览器书签，保留目录结构，一键保存为 KeePass 数据库。</p> -->
+            <div class="privacy-note"><ShieldCheck aria-hidden="true" /> 所有处理都在本地浏览器完成，文件不会上传。</div>
+        </section>
+
+        <div class="workspace">
+            <section class="card setup-card" aria-labelledby="import-title">
+                <div class="section-heading"><span class="step">01</span><h2 id="import-title">导入与导出</h2></div>
+                <input ref="fileInput" class="visually-hidden" type="file" multiple accept=".html,.htm,.json,application/json,text/json,text/html" :disabled="busy" aria-label="选择书签文件" @change="handleFiles" />
+                <button class="upload-zone" :disabled="busy" @click="fileInput.click()">
+                    <span class="upload-icon"><Upload aria-hidden="true" /></span>
+                    <strong>{{ files.length ? '重新选择书签文件' : '选择书签文件' }}</strong>
+                    <span>支持 HTML / JSON，可同时选择多个文件</span>
+                    <span class="select-label">浏览文件 <ArrowRight aria-hidden="true" /></span>
+                </button>
+                <ul v-if="files.length" class="file-list" aria-label="已选择的文件">
+                    <li v-for="(file, index) in files" :key="index"><FileText aria-hidden="true" /><span>{{ file.name }}</span><span class="file-size">{{ Math.max(1, Math.ceil(file.size / 1024)) }} KB</span></li>
+                </ul>
+                <div class="export-settings">
+                    <label for="password"><KeyRound aria-hidden="true" /> 数据库密码 <span>可选</span></label>
+                    <div class="password-field">
+                        <input id="password" v-model="password" :type="showPassword ? 'text' : 'password'" autocomplete="new-password" placeholder="输入密码以保护数据库" :disabled="busy" />
+                        <button type="button" class="icon-button" :aria-label="showPassword ? '隐藏密码' : '显示密码'" :aria-pressed="showPassword" @click="showPassword = !showPassword"><EyeOff v-if="showPassword" aria-hidden="true" /><Eye v-else aria-hidden="true" /></button>
+                    </div>
+                    <p class="field-hint">打开生成的 KDBX 文件时将使用此密码。</p>
+                    <button class="export-button" :disabled="busy || !stats.bookmarks" @click="generateKdbx"><LoaderCircle v-if="exporting" class="spinner" aria-hidden="true" /><ArrowDownToLine v-else aria-hidden="true" />{{ exporting ? '正在生成…' : '生成并下载 .kdbx' }}</button>
                 </div>
-            </div>
-            <div class="small" style="margin-top:8px">状态：{{ status }}</div>
-        </div>
+                <div v-if="status" class="status" :class="statusKind" role="status" aria-live="polite" aria-atomic="true"><LoaderCircle v-if="statusKind === 'working'" class="spinner" aria-hidden="true" /><CircleAlert v-else-if="statusKind === 'error'" aria-hidden="true" /><CheckCircle2 v-else aria-hidden="true" /><span>{{ status }}</span></div>
+            </section>
 
-        <div class="card">
-            <div><strong>解析预览</strong></div>
-            <div v-html="renderTree(tree)"></div>
+            <section class="card preview-card" aria-labelledby="preview-title" :aria-busy="parsing">
+                <div class="preview-header"><div class="section-heading"><span class="step">02</span><h2 id="preview-title">书签预览</h2></div><span class="format-badge">.kdbx</span></div>
+                <div v-if="tree.length" class="preview-stats"><span><Bookmark aria-hidden="true" /><strong>{{ stats.bookmarks }}</strong> 个书签</span><span><Folder aria-hidden="true" /><strong>{{ stats.folders }}</strong> 个文件夹</span></div>
+                <div v-if="tree.length" class="tree-scroll"><BookmarkTree :items="tree" /></div>
+                <div v-else class="empty-state"><span class="empty-icon"><LoaderCircle v-if="parsing" class="spinner" aria-hidden="true" /><Folder v-else aria-hidden="true" /></span><h3>{{ parsing ? '正在整理你的书签' : '你的书签将在这里呈现' }}</h3><p>{{ parsing ? '解析完成后即可预览并导出。' : '选择书签文件后，查看目录和书签内容。' }}</p></div>
+                <div class="preview-note"><CheckCircle2 aria-hidden="true" /> 保留文件夹层级，重复 URL 仅保留首次出现的书签。</div>
+            </section>
         </div>
-
-        <div class="footer">
-            <div class="small">提示：仅保留首次出现的 URL，保留目录结构。</div>
-            <div class="small">网站由 AI 生成并修改。</div>
-        </div>
-    </div>
+        <footer class="footer"><ShieldCheck aria-hidden="true" /> 本地转换 · 隐私优先<span>HTML / JSON <ArrowRight aria-hidden="true" /> KDBX</span></footer>
+    </main>
 </template>
