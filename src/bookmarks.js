@@ -1,7 +1,8 @@
 export function parseChromeBookmarksHtml(text) {
-    // Simple HTML parser for Chrome's exported bookmarks.html
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(text, 'text/html');
+    // Template contents stay inert: imported markup cannot load resources or run scripts.
+    const template = document.createElement('template');
+    template.innerHTML = text;
+    const doc = template.content;
     function walkDl(dl) {
         const items = [];
         for (const node of dl.childNodes) {
