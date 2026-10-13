@@ -4,6 +4,7 @@ import { ArrowDownToLine, ArrowRight, Bookmark, CheckCircle2, CircleAlert, FileT
 import BookmarkTree from './BookmarkTree.vue'
 import { mergeTrees, parseChromeBookmarksHtml, parseChromeBookmarksJson } from './bookmarks.js'
 import { createKdbx } from './exportKdbx.js'
+import { checkFileSelection, checkImportTree, createImportBudget, ImportLimitError } from './importLimits.js'
 
 const files = ref([])
 const tree = ref([])
@@ -39,19 +40,24 @@ async function handleFiles(event) {
     status.value = '正在读取并整理书签…'
     const trees = []
     const failed = []
+    const consume = createImportBudget()
     try {
+        checkFileSelection(selected)
         for (const file of selected) {
             try {
                 const text = await file.text()
                 let parsed
                 try {
                     parsed = parseChromeBookmarksJson(text)
-                } catch {
+                } catch (error) {
+                    if (error instanceof ImportLimitError) throw error
                     parsed = parseChromeBookmarksHtml(text)
                 }
+                checkImportTree(parsed, consume)
                 if (!parsed.length) failed.push(file.name)
                 else trees.push(parsed)
-            } catch {
+            } catch (error) {
+                if (error instanceof ImportLimitError) throw error
                 failed.push(file.name)
             }
         }
@@ -66,6 +72,10 @@ async function handleFiles(event) {
             statusKind.value = 'success'
             status.value = `解析完成，已整理 ${stats.value.bookmarks} 个书签。`
         }
+    } catch (error) {
+        tree.value = []
+        statusKind.value = 'error'
+        status.value = error instanceof ImportLimitError ? error.message : '无法整理书签，请检查文件格式。'
     } finally {
         parsing.value = false
         event.target.value = ''
@@ -137,7 +147,7 @@ async function generateKdbx() {
                         <input id="password" v-model="password" :type="showPassword ? 'text' : 'password'" autocomplete="new-password" placeholder="输入密码以保护数据库" :disabled="busy" />
                         <button type="button" class="icon-button" :aria-label="showPassword ? '隐藏密码' : '显示密码'" :aria-pressed="showPassword" @click="showPassword = !showPassword"><EyeOff v-if="showPassword" aria-hidden="true" /><Eye v-else aria-hidden="true" /></button>
                     </div>
-                    <p class="field-hint">打开生成的 KDBX 文件时将使用此密码。</p>
+                    <p class="field-hint">{{ password ? '打开生成的 KDBX 文件时将使用此密码。' : '未设置密码：任何拿到文件的人都能打开并查看书签。' }}</p>
                     <button class="export-button" :disabled="busy || !stats.bookmarks" @click="generateKdbx"><LoaderCircle v-if="exporting" class="spinner" aria-hidden="true" /><ArrowDownToLine v-else aria-hidden="true" />{{ exporting ? '正在生成…' : '生成并下载 .kdbx' }}</button>
                 </div>
                 <div v-if="status" class="status" :class="statusKind" role="status" aria-live="polite" aria-atomic="true"><LoaderCircle v-if="statusKind === 'working'" class="spinner" aria-hidden="true" /><CircleAlert v-else-if="statusKind === 'error'" aria-hidden="true" /><CheckCircle2 v-else aria-hidden="true" /><span>{{ status }}</span></div>
